@@ -12,8 +12,14 @@
 额度类型（对应 config 的 providers.<name>.quota.mode）：
 
 - ``monthly``  每月 1 日 0 点重置
-- ``daily``    每天 0 点重置，同时受 expires_at 约束
-- ``fixed``    一次性总额度，用完即止，可选 expires_at
+- ``daily``    每天 0 点重置
+- ``fixed``    一次性总额度，用完即止
+
+到期规则（两条互相独立，可都留空表示不过期）：
+
+- ``quota.expires_at``         绝对日期（``2027-02-15`` 或 ISO 时间），优先使用
+- ``quota.expires_after_days`` 从**首次成功转写**起算 N 天；首次用量的时间戳会写入账本的
+  ``first_used_at``，之后每次读账本都按 ``first_used_at + N 天`` 推算到期时间
 """
 
 from __future__ import annotations
@@ -34,6 +40,8 @@ ENTRY_DEFAULTS = {
     "period_key": "",
     "used_hours_total": 0.0,
     "expires_at": None,
+    "expires_after_days": None,
+    "first_used_at": None,
     "manual_exhausted": False,
     "manual_reason": None,
     "auth_failed_until": 0.0,
@@ -57,6 +65,18 @@ def _parse_expiry(value: str | None) -> float | None:
         return datetime.fromisoformat(text).timestamp()
     except ValueError:
         return None
+
+
+def _entry_expiry_ts(entry: dict) -> float | None:
+    """到期时间：绝对日期优先，其次按「首次使用 + N 天」推算。"""
+    absolute = _parse_expiry(entry.get("expires_at"))
+    if absolute is not None:
+        return absolute
+    days = entry.get("expires_after_days")
+    first_used = _parse_expiry(entry.get("first_used_at"))
+    if not days or first_used is None:
+        return None
+    return first_used + float(days) * 86400
 
 
 def _period_key(mode: str, ts: float) -> str:
@@ -154,6 +174,13 @@ class Ledger:
                 if entry.get("manual_exhausted"):
                     entry["manual_exhausted"] = False
                     entry["manual_reason"] = None
+            # 旧版本账本没有 first_used_at：用过就按最后一次用量补记，避免试用期永不开始
+            if (
+                entry.get("expires_after_days")
+                and not entry.get("first_used_at")
+                and float(entry.get("used_hours_total") or 0) > 0
+            ):
+                entry["first_used_at"] = entry.get("last_used_at") or entry.get("updated_at") or local_iso()
 
     def _mutate(self, name: str, apply) -> None:
         """在跨进程排他锁内完成 读盘 -> 修改 -> 原子写。"""
@@ -178,6 +205,7 @@ class Ledger:
                     entry["quota_mode"] = cfg.quota.mode
                     entry["quota_hours"] = float(cfg.quota.hours)
                     entry["expires_at"] = cfg.quota.expires_at
+                    entry["expires_after_days"] = cfg.quota.expires_after_days
                 self._normalize_periods()
                 self._write()
 
@@ -187,7 +215,7 @@ class Ledger:
     def expires_ts(self, name: str) -> float | None:
         with self._lock:
             self._refresh()
-            return _parse_expiry(self._entry(name).get("expires_at"))
+            return _entry_expiry_ts(self._entry(name))
 
     def is_expired(self, name: str) -> bool:
         expiry = self.expires_ts(name)
@@ -229,7 +257,7 @@ class Ledger:
             entry = self._entry(name)
             cfg = self.configs[name]
             remaining = self._remaining_locked(name)
-            expiry = _parse_expiry(entry.get("expires_at"))
+            expiry = _entry_expiry_ts(entry)
             next_reset = _next_reset_ts(entry["quota_mode"], now_ts())
 
             if entry.get("manual_exhausted"):
@@ -257,6 +285,8 @@ class Ledger:
                 "remaining_hours": remaining,
                 "remaining_text": fmt_hours(remaining),
                 "expires_at": entry.get("expires_at"),
+                "expires_after_days": entry.get("expires_after_days"),
+                "first_used_at": entry.get("first_used_at"),
                 "expires_ts": expiry,
                 "next_reset_ts": next_reset,
                 "manual_exhausted": bool(entry.get("manual_exhausted")),
@@ -279,6 +309,8 @@ class Ledger:
             return
 
         def apply(entry: dict) -> None:
+            if not entry.get("first_used_at"):
+                entry["first_used_at"] = local_iso()
             entry["used_hours_period"] = float(entry.get("used_hours_period") or 0) + hours
             entry["used_hours_total"] = float(entry.get("used_hours_total") or 0) + hours
             entry["last_used_at"] = local_iso()

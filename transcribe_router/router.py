@@ -67,10 +67,14 @@ class Router:
     # 展示
     # ------------------------------------------------------------------ #
     def expiry_text(self, name: str) -> str:
-        expires_ts = self.ledger.expires_ts(name)
+        status = self.ledger.status(name)
+        expires_ts = status["expires_ts"]
         if not expires_ts:
+            days = status.get("expires_after_days")
+            if days:
+                return f"首次成功转写后 {float(days):g} 天到期"
             return "长期（无固定到期日）"
-        suffix = "（已过期）" if self.ledger.is_expired(name) else ""
+        suffix = "（已过期）" if expires_ts <= time.time() else ""
         return f"{fmt_ts(expires_ts)}{suffix}"
 
     def quota_line(self, name: str) -> str:
@@ -100,6 +104,11 @@ class Router:
                 lines.append(f"     ! 鉴权失败冷却中：{status['last_error'] or ''}")
             elif status["down_until"] > time.time():
                 lines.append(f"     ! 连续失败熔断中：{status['last_error'] or ''}")
+            elif status["state"] == "额度已过期":
+                lines.append(
+                    f"     ! 免费额度已于 {fmt_ts(status['expires_ts'])} 过期，不会参与自动路由"
+                    "（如已在控制台续期，请改 config 的 expires_at / expires_after_days 或 reset）"
+                )
         if self.forced:
             lines.append(f"  * --provider 已强制指定：{self.forced}（不会自动降级到其它家）")
         lines.append("=" * 78)

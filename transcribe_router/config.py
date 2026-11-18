@@ -41,10 +41,11 @@ PROVIDER_DEFAULTS: dict[str, dict] = {
         "options": {"region": "cn-shanghai", "version": "4.0", "enable_words": False},
     },
     "bailian": {
-        "display": "阿里云百炼 Paraformer（非实时）",
+        "display": "阿里云百炼 Paraformer（录音文件识别）",
         "priority": 10,
         "requires_url": True,
-        "quota": {"mode": "fixed", "hours": 10, "expires_at": None},
+        # paraformer-v2：10 小时/月，每月 1 日发放，有效期 1 个月（官方定价页）
+        "quota": {"mode": "monthly", "hours": 10, "expires_at": None},
         "limits": {"max_file_seconds": 12 * 3600, "max_file_mb": 2048, "qps": 1},
         "options": {"model": "paraformer-v2", "workspace_id": ""},
     },
@@ -96,7 +97,12 @@ PROVIDER_ORDER = ["tencent", "aliyun_isi", "bailian", "tingwu", "iflytek", "volc
 class QuotaConfig:
     mode: str = "monthly"  # monthly | daily | fixed
     hours: float = 0.0
+    # 到期规则二选一：
+    #   expires_at        绝对日期（YYYY-MM-DD 或 ISO 时间），官方直接给了到期日时用
+    #   expires_after_days 从「首次成功转写」起算的天数，官方只说“试用 90 天”时用
+    # 两者都填时以 expires_at 为准；都留空表示不设到期
     expires_at: str | None = None
+    expires_after_days: float | None = None
 
 
 @dataclass
@@ -491,10 +497,19 @@ def load_config(path: str | os.PathLike) -> AppConfig:
         merged = _merge(defaults, override)
 
         quota_raw = merged.get("quota") or {}
+        after_days_raw = quota_raw.get("expires_after_days")
+        after_days = None
+        if after_days_raw is not None and str(after_days_raw).strip() not in ("", "0", "0.0"):
+            after_days = _as_float(after_days_raw, f"providers.{name}.quota.expires_after_days")
+            if after_days <= 0:
+                raise ConfigError(f"providers.{name}.quota.expires_after_days 必须大于 0")
+        expires_raw = quota_raw.get("expires_at")
         quota = QuotaConfig(
             mode=str(quota_raw.get("mode", "monthly")),
             hours=_as_float(quota_raw.get("hours", 0), f"providers.{name}.quota.hours"),
-            expires_at=quota_raw.get("expires_at") or None,
+            # PyYAML 会把未加引号的日期解析成 date/datetime，统一转成字符串再入账本
+            expires_at=str(expires_raw).strip() if expires_raw else None,
+            expires_after_days=after_days,
         )
         if quota.mode not in ("monthly", "daily", "fixed"):
             raise ConfigError(f"providers.{name}.quota.mode 只能是 monthly / daily / fixed")

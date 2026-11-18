@@ -209,6 +209,57 @@ mock:
 """
 
 
+EXPIRED_TEMPLATE = """
+state_dir: ./{state}/state
+routing:
+  min_remaining_minutes: 0.01
+  retries_per_provider: 0
+  retry_backoff_seconds: 0.01
+  poll_interval_seconds: 0.01
+  poll_timeout_seconds: 60
+concurrency:
+  workers: 1
+  per_provider: 1
+segmentation:
+  mode: fixed
+  max_seconds: 6
+output:
+  dir: ./{state}/out
+  json: true
+  srt: false
+hosting:
+  mode: url_prefix
+  url_prefix: https://example.invalid/asr
+  local_root: ./{state}/public
+providers:
+  tencent:
+    enabled: true
+    priority: 10
+    quota:
+      mode: monthly
+      hours: 10
+      expires_at: "2020-01-01"
+  aliyun_isi:
+    enabled: false
+  bailian:
+    enabled: false
+  tingwu:
+    enabled: false
+  iflytek:
+    enabled: true
+    priority: 3
+    quota:
+      mode: fixed
+      hours: 0.002
+  volcano:
+    enabled: false
+  netease:
+    enabled: false
+mock:
+  providers:
+"""
+
+
 def write_config(path: Path, state: str, extra_mock: str) -> Path:
     path.write_text(CONFIG_TEMPLATE.format(state=state, extra_mock=extra_mock), encoding="utf-8")
     return path
@@ -278,6 +329,50 @@ def test_concurrency_boundaries() -> None:
     cfg_obj.providers["tencent"].quota.expires_at = "2099-01-01"
     ledger.sync_configs()
     check("到期日在未来则正常", ledger.remaining_hours("tencent") > 0)
+
+    # 5.2b 「首次使用起算 N 天」：未用过不计时，用过 90 天后自动失效
+    isi_quota = cfg_obj.providers["aliyun_isi"].quota
+    isi_quota.expires_at = None
+    isi_quota.expires_after_days = 90
+    ledger.sync_configs()
+    check("未发生首次使用时不启用试用倒计时", ledger.expires_ts("aliyun_isi") is None)
+
+    original_iso = ledger_mod.local_iso
+    try:
+        ledger_mod.now_ts = lambda: datetime(2026, 1, 1, 12, 0, 0).timestamp()
+        ledger_mod.local_iso = lambda ts=None: datetime.fromtimestamp(
+            ts if ts is not None else ledger_mod.now_ts()
+        ).isoformat()
+        ledger.record_usage("aliyun_isi", 0.5)
+        after_use_expiry = ledger.expires_ts("aliyun_isi")
+
+        ledger_mod.now_ts = lambda: datetime(2026, 3, 31, 12, 0, 0).timestamp()
+        before_deadline = ledger.remaining_hours("aliyun_isi")
+        ledger_mod.now_ts = lambda: datetime(2026, 4, 1, 12, 0, 1).timestamp()
+        after_deadline = ledger.remaining_hours("aliyun_isi")
+        expired_state = ledger.status("aliyun_isi")["state"]
+
+        # 绝对日期优先于「首次使用 + N 天」
+        isi_quota.expires_at = "2026-02-01"
+        ledger.sync_configs()
+        ledger_mod.now_ts = lambda: datetime(2026, 2, 2, 12, 0, 0).timestamp()
+        absolute_wins = ledger.remaining_hours("aliyun_isi")
+    finally:
+        ledger_mod.now_ts = original_now
+        ledger_mod.local_iso = original_iso
+        isi_quota.expires_at = None
+        ledger.sync_configs()
+
+    expected_expiry = datetime(2026, 4, 1, 12, 0, 0).timestamp()
+    check(
+        "首次成功转写后按 90 天推算到期",
+        abs((after_use_expiry or 0) - expected_expiry) < 2,
+        str(after_use_expiry),
+    )
+    check("试用期内仍可用", abs(before_deadline - 2.0) < 1e-6, f"实际 {before_deadline}")
+    check("超过 90 天后剩余额度归零", after_deadline == 0, f"实际 {after_deadline}")
+    check("到期状态为「额度已过期」", expired_state == "额度已过期", expired_state)
+    check("绝对到期日优先于首次使用推算", absolute_wins == 0, f"实际 {absolute_wins}")
 
     # 5.3 跨切点句子：保留并裁剪，不丢内容
     rows = [
@@ -454,6 +549,19 @@ def main() -> int:
     check("熔断场景退出码为 2", proc.returncode == 2, f"实际 {proc.returncode}")
     check("连续失败 2 次后停止调用该家（4 段只尝试 2 次）", circuit_log.count("[降级]") == 2, f"实际 {circuit_log.count('[降级]')}")
     check("日志提示熔断原因", "连续失败熔断中" in circuit_log)
+
+    print("\n7) 试用额度到期：自动跳过并打印原因")
+    cfg_expired = WORK / "config_expired.yaml"
+    cfg_expired.write_text(EXPIRED_TEMPLATE.format(state="run5"), encoding="utf-8")
+    proc = run_cli(
+        ["run", str(WORK / "audios2"), "-o", str(WORK / "run5" / "out"), "--dry-run", "-v"],
+        cfg_expired,
+    )
+    expired_log = proc.stdout + proc.stderr
+    check("到期场景仍能跑完（自动降级到未过期 provider）", proc.returncode == 0, f"实际 {proc.returncode}")
+    check("启动时打印过期日期与不参与路由的原因", "免费额度已于" in expired_log and "不会参与自动路由" in expired_log)
+    check("跳过原因包含「免费额度已过期」", "免费额度已过期" in expired_log)
+    check("产出由未过期的 provider 完成", (WORK / "run5" / "out" / "resume_c.json").exists())
 
     print("\n" + "=" * 70)
     print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")

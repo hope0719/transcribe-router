@@ -7,7 +7,9 @@
 - 结果在 output.results[].transcription_url（有效期 24 小时），下载后是 transcripts[].sentences[]
 - 单文件 ≤12 小时、≤2GB
 
-百炼的模型名可配置：paraformer-v2 / paraformer-1 / fun-asr（不同模型免费额度不同，额度以控制台为准）。
+百炼录音文件识别可用模型：paraformer-v2 / paraformer-8k-v2 / fun-asr。
+免费额度按模型独立发放：paraformer-v2 为 10 小时/月（每月 1 日，有效期 1 个月），
+fun-asr 为 10 小时一次性（开通/发布起 90 天）；仅华北2（北京）地域有免费额度。
 """
 
 from __future__ import annotations

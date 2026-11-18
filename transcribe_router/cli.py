@@ -140,6 +140,14 @@ def cmd_run(args) -> int:
     return 0 if not failed else 2
 
 
+def _expiry_cell(row: dict) -> str:
+    if row.get("expires_ts"):
+        return fmt_ts(row["expires_ts"])
+    if row.get("expires_after_days"):
+        return f"首次用后{float(row['expires_after_days']):g}天"
+    return "无"
+
+
 def cmd_quota(args) -> int:
     cfg, _ = _load(args)
     ledger = open_ledger(cfg)
@@ -158,7 +166,7 @@ def cmd_quota(args) -> int:
             f"{row['name']:<12}{row['display'][:28]:<30}{mode_text.get(row['mode'], row['mode']):<8}"
             f"{fmt_hours(row['quota_hours']):>9}{fmt_hours(row['used_hours_period']):>10}"
             f"{fmt_hours(row['remaining_hours']):>10}  "
-            f"{fmt_ts(row['expires_ts']) if row['expires_ts'] else '无':<20}{row['state']}"
+            f"{_expiry_cell(row):<20}{row['state']}"
         )
     print("")
     print(f"账本文件：{cfg.state_dir / 'ledger.json'}")
