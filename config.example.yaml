@@ -1,0 +1,232 @@
+# ============================================================================
+# 批量录音转写 · 多 Provider 额度轮换
+# 用法：
+#   1. cp config.example.yaml config.yaml
+#   2. cp .env.example .env  然后填 Key
+#   3. python -m transcribe_router quota          # 看额度
+#   4. python -m transcribe_router run ./audios -o ./out
+#
+# 说明：
+#   - 所有 Key 都通过 ${环境变量} 读取，配置文件里不要写明文
+#   - quota.mode：monthly=每月 1 日重置 / daily=每天重置（可加 expires_at）/ fixed=一次性
+#   - quota.hours：这一家你能用的总小时数，请按你自己账号实际发放的额度填
+#   - priority：数值越大越优先；讯飞、网易见外默认压低，保证最后才被选中
+# ============================================================================
+
+state_dir: ./.tr_state
+
+routing:
+  # 剩余不足这么多分钟就当额度耗尽
+  min_remaining_minutes: 1
+  # 单段在某家遇到网络/限流错误时的重试次数，重试完仍失败则降级
+  retries_per_provider: 2
+  retry_backoff_seconds: 3
+  # 异步任务轮询间隔与最长等待
+  poll_interval_seconds: 5
+  poll_timeout_seconds: 7200
+  # 鉴权失败后该家冷却多少分钟再重试
+  auth_retry_minutes: 30
+  # 同一家连续失败多少次后熔断（冷却期内不再被选中，避免每段都去撞同一个坏接口）
+  max_consecutive_failures: 3
+  failure_cooldown_minutes: 15
+
+concurrency:
+  # 全局同时处理的片段数
+  workers: 2
+  # 同一家同时在跑的任务数（讯飞个人包只有 2 并发）
+  per_provider: 1
+
+segmentation:
+  # silence：把切点吸附到静音处；fixed：按固定时长切
+  mode: silence
+  # 0 表示自动取「当前可用 provider 中最小的单文件上限」
+  max_seconds: 0
+  # 段间重叠秒数：重叠区归上一段，合并时丢弃本段落在重叠区的句子，避免重复
+  overlap_seconds: 0.5
+  silence_noise_db: -35
+  silence_min_seconds: 0.4
+  search_window_seconds: 30
+
+output:
+  dir: ./out
+  json: true
+  srt: true
+  # >0 时按标点把过长句子拆成多条字幕（0 = 不拆）
+  srt_max_chars: 0
+  # 保留切出来的音频片段（排障用）
+  keep_segments: false
+
+# 只接受公网 URL 的四家（阿里云 ISI / 百炼 / 通义听悟 / 火山）需要这个。
+# 做法：把 local_root 配成你 Web 服务器/对象存储同步目录，url_prefix 配成对应的公网前缀。
+# 没配置时这四家会被自动跳过，只剩讯飞 / 网易见外（它们支持本地上传）。
+hosting:
+  mode: none            # none | url_prefix
+  url_prefix: ""        # 例如 https://files.example.com/asr
+  local_root: ""        # 例如 /var/www/asr 或 ./public
+
+providers:
+  # ------------------------------------------------------------------ #
+  # 1) 腾讯云 ASR：10 小时/月，每月 1 日重置
+  # ------------------------------------------------------------------ #
+  tencent:
+    enabled: true
+    priority: 10
+    credentials:
+      secret_id: ${TENCENT_SECRET_ID}
+      secret_key: ${TENCENT_SECRET_KEY}
+    quota:
+      mode: monthly
+      hours: 10
+    limits:
+      max_file_seconds: 18000     # 5 小时
+      max_file_mb: 1024
+      qps: 20
+    options:
+      region: ap-shanghai
+      engine_model_type: 16k_zh
+      res_text_format: 3          # 3 = 按标点分段，带句级时间戳，适合字幕
+      speaker_diarization: 0
+
+  # ------------------------------------------------------------------ #
+  # 2) 阿里云 ISI：试用 3 个月，每天 2 小时；单文件 ≤12h/512MB
+  #    额度池与百炼、通义听悟完全独立，单独记账
+  # ------------------------------------------------------------------ #
+  aliyun_isi:
+    enabled: true
+    priority: 10
+    credentials:
+      access_key_id: ${ALIYUN_ACCESS_KEY_ID}
+      access_key_secret: ${ALIYUN_ACCESS_KEY_SECRET}
+      appkey: ${ALIYUN_ISI_APPKEY}
+    quota:
+      mode: daily
+      hours: 2
+      expires_at: ""              # 填试用到期日，例如 2027-02-15；留空表示不限制
+    limits:
+      max_file_seconds: 43200     # 12 小时
+      max_file_mb: 512
+      qps: 1                      # 同一 TaskId 查询限 1 QPS
+    options:
+      region: cn-shanghai
+      version: "4.0"
+      enable_words: false
+
+  # ------------------------------------------------------------------ #
+  # 3) 阿里云百炼 Paraformer：10 小时/90 天（fun-asr 模型额度另算）
+  # ------------------------------------------------------------------ #
+  bailian:
+    enabled: true
+    priority: 10
+    credentials:
+      api_key: ${DASHSCOPE_API_KEY}
+    quota:
+      mode: fixed
+      hours: 10
+      expires_at: ""
+    limits:
+      max_file_seconds: 43200
+      max_file_mb: 2048
+      qps: 1
+    options:
+      model: paraformer-v2        # 也可填 fun-asr / paraformer-1
+      workspace_id: ""
+
+  # ------------------------------------------------------------------ #
+  # 4) 通义听悟：90 天试用，文件转写 2 小时/天（额度最大，但签名未验证）
+  #    !! 实验性：官方未公开完整签名示例，见 README「未验证」一节；
+  #       如果签名对不上会返回 4xx，路由层会自动降级到下一家
+  # ------------------------------------------------------------------ #
+  tingwu:
+    enabled: true
+    priority: 10
+    credentials:
+      access_key_id: ${ALIYUN_ACCESS_KEY_ID}
+      access_key_secret: ${ALIYUN_ACCESS_KEY_SECRET}
+      app_key: ${TINGWU_APP_KEY}
+    quota:
+      mode: daily
+      hours: 2
+      expires_at: ""
+    limits:
+      max_file_seconds: 43200
+      max_file_mb: 2048
+      qps: 1
+    options:
+      source_language: cn
+      diarization: true
+
+  # ------------------------------------------------------------------ #
+  # 5) 讯飞开放平台：个人 5 小时/年（企业 50 小时/年）
+  #    支持本地分片上传；单文件 ≤5h/500MB
+  # ------------------------------------------------------------------ #
+  iflytek:
+    enabled: true
+    priority: 3                 # 额度小，压低优先级
+    credentials:
+      app_id: ${IFLYTEK_APP_ID}
+      secret_key: ${IFLYTEK_SECRET_KEY}
+    quota:
+      mode: fixed
+      hours: 5
+      expires_at: ""
+    limits:
+      max_file_seconds: 18000
+      max_file_mb: 500
+      qps: 20
+    options:
+      language: cn
+      has_seperate: false
+      slice_mb: 10
+
+  # ------------------------------------------------------------------ #
+  # 6) 火山引擎豆包：20 小时/半年；单文件 <5h/512MB；只收 URL
+  # ------------------------------------------------------------------ #
+  volcano:
+    enabled: true
+    priority: 10
+    credentials:
+      appid: ${VOLC_APPID}
+      token: ${VOLC_TOKEN}
+      cluster: ${VOLC_CLUSTER}
+    quota:
+      mode: fixed
+      hours: 20
+      expires_at: ""
+    limits:
+      max_file_seconds: 18000
+      max_file_mb: 512
+      qps: 1
+    options:
+      uid: transcribe-router
+      with_speaker_info: true
+
+  # ------------------------------------------------------------------ #
+  # 7) 网易见外（有道长语音转写）：300 分钟/30 天；本地分片上传
+  #    免费额度小、单价高（约 24 元/小时），默认优先级最低
+  # ------------------------------------------------------------------ #
+  netease:
+    enabled: true
+    priority: 1
+    credentials:
+      app_key: ${NETEASE_APP_KEY}
+      app_secret: ${NETEASE_APP_SECRET}
+    quota:
+      mode: fixed
+      hours: 5                    # 300 分钟
+      expires_at: ""
+    limits:
+      max_file_seconds: 14400     # 4 小时（中文 zh-CHS2）
+      max_file_mb: 500
+      qps: 1
+    options:
+      lang_type: zh-CHS2
+      need_speaker_id: false
+      slice_mb: 10
+
+# 仅 --dry-run 生效：给某个 provider 注入故障，用来验证降级
+mock:
+  providers: {}
+  #  providers:
+  #    aliyun_isi:
+  #      auth_fail: true
+  #      transient_failures: 0

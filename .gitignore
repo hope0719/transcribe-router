@@ -1,0 +1,10 @@
+.env
+config.yaml
+.tr_state/
+out/
+public/
+verify_out/
+*.wav
+*.mp3
+__pycache__/
+*.pyc
